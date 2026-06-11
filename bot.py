@@ -10,10 +10,6 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes
 )
-from knowledge import (
-    KNOWN_NAMES_FOT, KNOWN_NAMES_70, KNOWN_NAMES_30,
-    KEYWORD_CATEGORY_MAP, COMBO_RULES
-)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -22,8 +18,50 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_KEY")
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+expenses = []
 
-expenses = []  # {date, amount, category, description, user, chat_id}
+# ─── БАЗА ЗНАНИЙ ──────────────────────────────────────────────────────────────
+
+KNOWN_NAMES_FOT = [
+    "комолиддин", "аброр", "фахридин", "ойбек", "шавкат", "жохонгир", "тохир",
+    "сагдина", "мохи", "самандар", "зиевуддин", "сунат", "даврон",
+    "зухрат", "муслима", "султон мурод", "султон", "мурод", "бозор", "тогара",
+    "мойка", "уборка", "тозалаш"
+]
+KNOWN_NAMES_70 = ["шохрух"]
+KNOWN_NAMES_30 = []
+
+COMBO_RULES = {
+    "кампод такси": "сырьё", "кампот такси": "сырьё",
+    "такси бозор": "аренда", "такси мева": "аренда",
+    "сув 10л": "сырьё", "мойка уборка": "ФОТ",
+}
+
+KEYWORD_CATEGORY_MAP = {
+    "мясо": "мясо", "гўшт": "мясо", "гушт": "мясо", "қази": "мясо", "кази": "мясо", "тузлама": "мясо",
+    "сырьё": "сырьё", "сырье": "сырьё",
+    "сут": "сырьё", "молоко": "сырьё", "сув": "сырьё", "вода": "сырьё",
+    "когоз": "сырьё", "купия": "сырьё", "кампод": "сырьё", "кампот": "сырьё",
+    "ун": "сырьё", "мука": "сырьё", "туз": "сырьё", "соль": "сырьё",
+    "қанд": "сырьё", "канд": "сырьё", "сахар": "сырьё",
+    "картошка": "сырьё", "картофель": "сырьё", "помидор": "сырьё",
+    "бодринг": "сырьё", "пиёз": "сырьё", "лук": "сырьё",
+    "рис": "рис", "guruch": "рис",
+    "ёғ": "масло", "ег": "масло", "масло": "масло", "yog": "масло",
+    "мева": "фрукты", "урик": "фрукты", "тарвуз": "фрукты", "гулос": "фрукты",
+    "савзи": "савзи", "морковь": "савзи",
+    "нон": "хлеб", "хлеб": "хлеб", "лаваш": "хлеб",
+    "чой": "напитки", "чай": "напитки", "кола": "кола", "напитки": "напитки",
+    "такси": "аренда", "транспорт": "аренда", "транспортировка": "аренда", "тахи": "аренда",
+    "машина": "аренда", "бензин": "аренда",
+    "алиса": "телефония", "программа": "телефония", "интернет": "телефония", "телефон": "телефония",
+    "газ": "оплата за газ",
+    "электр": "электроэнергия", "свет": "электроэнергия",
+    "налог": "налог", "ндс": "налог", "солик": "налог",
+    "аренда": "аренда", "ижара": "аренда",
+    "банк": "дебит кредит", "комиссия": "дебит кредит",
+    "благоустройство": "благоустройство", "эхсон": "эхсон",
+}
 
 CATEGORIES = [
     "мясо", "напитки", "сырьё", "оплата за газ", "рис", "ФОТ",
@@ -43,112 +81,49 @@ EMOJI_MAP = {
     "эхсон": "📌", "мфй": "📌", "посуда": "🍽️"
 }
 
-def extract_amount(text):
-    """Extract number from text like '50.000', '2*50.000=100.000', '1 800 000'"""
-    # Formula like 2*50.000=100.000 — take the result after =
-    eq_match = re.search(r'=\s*([\d\s.,]+)', text)
-    if eq_match:
-        num = eq_match.group(1).replace(' ', '').replace('.', '').replace(',', '')
-        try:
-            return float(num)
-        except:
-            pass
-    # Regular numbers with dots/spaces as thousands separators
-    numbers = re.findall(r'\d[\d\s.,]*\d|\d+', text)
-    for n in reversed(numbers):
-        cleaned = n.replace(' ', '').replace('.', '').replace(',', '')
-        try:
-            val = float(cleaned)
-            if val > 100:  # Skip small numbers like quantity
-                return val
-        except:
-            pass
-    return None
-
-def categorize_local(text):
-    """Try to categorize using local knowledge base first."""
-    text_lower = text.lower().strip()
-
-    # Check combo rules first
-    for combo, cat in COMBO_RULES.items():
-        if combo in text_lower:
-            return cat
-
-    # Check known names for 70%
-    for name in KNOWN_NAMES_70:
-        if name in text_lower:
-            return "70%"
-
-    # Check known names for 30%
-    for name in KNOWN_NAMES_30:
-        if name in text_lower:
-            return "30%"
-
-    # Check known FOT names
-    for name in KNOWN_NAMES_FOT:
-        if name in text_lower:
-            return "ФОТ"
-
-    # Check keyword map
-    for keyword, cat in KEYWORD_CATEGORY_MAP.items():
-        if keyword.lower() in text_lower:
-            return cat
-
-    return None
+# ─── ЛОГИКА ───────────────────────────────────────────────────────────────────
 
 def parse_expense_with_ai(text):
-    """Use Claude AI to parse expense — supports Russian and Uzbek."""
     try:
         categories_str = ", ".join(CATEGORIES)
         response = client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=500,
-            messages=[{
-                "role": "user",
-                "content": f"""Ты помощник для учёта расходов ресторана. Текст может быть на русском или узбекском языке.
+            max_tokens=800,
+            messages=[{"role": "user", "content": f"""Ты помощник учёта расходов ресторана. Текст на русском или узбекском.
 
-Извлеки ВСЕ расходы из этого сообщения. Каждая строка может быть отдельным расходом.
-Верни ТОЛЬКО JSON массив без комментариев и markdown:
-[
-  {{"amount": число, "category": "категория", "description": "описание", "found": true}},
-  ...
-]
+Извлеки ВСЕ расходы из сообщения. Верни ТОЛЬКО JSON массив:
+[{{"amount": число, "category": "категория", "description": "описание", "found": true}}]
 
 Категории: {categories_str}
 
 Правила:
-- Имена людей (Аброр, Шавкат, Сагдина и др.) → ФОТ
+- Имена людей (Аброр, Шавкат, Сагдина, Султон Мурод и др.) → ФОТ
 - Шохрух → 70%
 - Такси, транспорт, тахи → аренда
-- Кампод такси, Кампот → сырьё
+- Кампод такси, Кампот → сырьё  
 - Алиса программа → телефония
 - Гўшт, мясо, қази → мясо
 - Сут, молоко → сырьё
 - Нон, хлеб → хлеб
-- Фрукты, мева, урик, тарвуз → фрукты
-- Формулы типа "2*50.000=100.000" — берём итоговую сумму 100000
+- Фрукты, мева, урик, тарвуз, гулос → фрукты
+- Формулы "2*50.000=100.000" → берём 100000
 - Точки в числах — разделитель тысяч: 50.000 = 50000
-- Если сумма не указана (прочерк или пусто) — пропусти эту строку
-- Если это не расход (заголовок, итог, остаток) — пропусти
+- Если сумма не указана (прочерк, пусто) — пропусти
+- Заголовки, итоги, остатки — пропусти
 
 Сообщение:
-{text}"""
-            }]
+{text}"""}]
         )
         raw = response.content[0].text.strip()
         raw = re.sub(r'```json|```', '', raw).strip()
         result = json.loads(raw)
-        if isinstance(result, list):
-            return result
-        return []
+        return result if isinstance(result, list) else []
     except Exception as e:
-        logger.error(f"AI parse error: {e}")
+        logger.error(f"AI error: {e}")
         return []
 
 def format_report(month, year, chat_expenses):
-    filtered = [e for e in chat_expenses
-                if e['date'].month == month and e['date'].year == year]
-
+    filtered = [e for e in chat_expenses if e['date'].month == month and e['date'].year == year]
     if not filtered:
         return f"📭 Нет данных за {month:02d}.{year}"
 
@@ -157,47 +132,38 @@ def format_report(month, year, chat_expenses):
         by_category[e['category']] += e['amount']
 
     total = sum(v for k, v in by_category.items() if k != "доход")
-
     month_names = {1:"Январь",2:"Февраль",3:"Март",4:"Апрель",5:"Май",6:"Июнь",
                    7:"Июль",8:"Август",9:"Сентябрь",10:"Октябрь",11:"Ноябрь",12:"Декабрь"}
 
     lines = [f"📊 *{month_names.get(month, month)} {year}*\n"]
-    sorted_cats = sorted(by_category.items(), key=lambda x: x[1], reverse=True)
-
-    for cat, amount in sorted_cats:
+    for cat, amount in sorted(by_category.items(), key=lambda x: x[1], reverse=True):
         emoji = EMOJI_MAP.get(cat, "📌")
         pct = (amount / total * 100) if total > 0 and cat != "доход" else 0
         lines.append(f"{emoji} *{cat}*: {amount:,.0f} сум ({pct:.1f}%)")
-
     lines.append(f"\n━━━━━━━━━━━━━━━")
-    lines.append(f"💰 *ИТОГО расходов: {total:,.0f} сум*")
+    lines.append(f"💰 *ИТОГО: {total:,.0f} сум*")
     lines.append(f"📝 Записей: {len(filtered)}")
     return "\n".join(lines)
 
+# ─── ХЕНДЛЕРЫ ─────────────────────────────────────────────────────────────────
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 *Привет! Я бот учёта расходов*\n\n"
-        "Отправляйте отчёты в любом формате — на русском или узбекском:\n\n"
-        "```\nГўшт 50.000\nАброр 350.000\nТакси 30.000\nАлиса программа 615.000\n```\n\n"
-        "Я сам распознаю категории!\n\n"
-        "📌 *Команды:*\n"
-        "/report — отчёт за текущий месяц\n"
-        "/report 5 2025 — отчёт за май 2025\n"
-        "/list — последние 10 записей\n"
-        "/help — справка",
+        "👋 *Привет! Бот учёта расходов*\n\n"
+        "Отправляйте отчёты на русском или узбекском:\n"
+        "```\nГўшт 50.000\nАброр 350.000\nТакси 30.000\n```\n\n"
+        "*/report* — отчёт за месяц\n"
+        "*/report 5 2025* — май 2025\n"
+        "*/list* — последние записи",
         parse_mode="Markdown"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    if not text or text.startswith('/'):
-        return
-    if update.message.from_user.is_bot:
+    if not text or text.startswith('/') or update.message.from_user.is_bot:
         return
 
-    # Try AI parsing for full report blocks
     items = parse_expense_with_ai(text)
-
     if not items:
         return
 
@@ -223,7 +189,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         e = saved[0]
         emoji = EMOJI_MAP.get(e['category'], "📌")
         await update.message.reply_text(
-            f"✅ *Записано!*\n{emoji} {e['category']}\n💵 {e['amount']:,.0f} сум\n📝 {e['description']}",
+            f"✅ {emoji} *{e['category']}*\n💵 {e['amount']:,.0f} сум\n📝 {e['description']}",
             parse_mode="Markdown"
         )
     else:
@@ -231,8 +197,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = [f"✅ *Записано {len(saved)} позиций:*\n"]
         for e in saved:
             emoji = EMOJI_MAP.get(e['category'], "📌")
-            lines.append(f"{emoji} {e['description']}: {e['amount']:,.0f} сум → *{e['category']}*")
-        lines.append(f"\n💰 Итого: *{total:,.0f} сум*")
+            lines.append(f"{emoji} {e['description']}: {e['amount']:,.0f} → *{e['category']}*")
+        lines.append(f"\n💰 *Итого: {total:,.0f} сум*")
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -240,35 +206,31 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     month, year = now.month, now.year
     if context.args:
         try:
-            if len(context.args) >= 1:
-                month = int(context.args[0])
-            if len(context.args) >= 2:
-                year = int(context.args[1])
+            if len(context.args) >= 1: month = int(context.args[0])
+            if len(context.args) >= 2: year = int(context.args[1])
         except ValueError:
             await update.message.reply_text("❌ Формат: /report 5 2025")
             return
     chat_expenses = [e for e in expenses if e['chat_id'] == update.effective_chat.id]
-    report = format_report(month, year, chat_expenses)
-    await update.message.reply_text(report, parse_mode="Markdown")
+    await update.message.reply_text(format_report(month, year, chat_expenses), parse_mode="Markdown")
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_expenses = [e for e in expenses if e['chat_id'] == update.effective_chat.id]
     recent = sorted(chat_expenses, key=lambda x: x['date'], reverse=True)[:10]
     if not recent:
-        await update.message.reply_text("📭 Нет записанных расходов.")
+        await update.message.reply_text("📭 Нет записей.")
         return
     lines = ["📋 *Последние записи:*\n"]
     for e in recent:
         emoji = EMOJI_MAP.get(e['category'], "📌")
-        lines.append(f"{emoji} {e['date'].strftime('%d.%m')} | *{e['category']}* | {e['amount']:,.0f} сум | {e['description'][:40]}")
+        lines.append(f"{emoji} {e['date'].strftime('%d.%m')} | *{e['category']}* | {e['amount']:,.0f} | {e['description'][:35]}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 *Справка*\n\n"
-        "Бот понимает русский и узбекский язык.\n"
-        "Просто отправьте отчёт — бот сам разберёт:\n\n"
-        "```\nГўшт 50.000\nНон 5*4500=20.000\nАброр 350.000\nТакси 30.000\n```\n\n"
+        "Пишите расходы в любом формате:\n"
+        "```\nГўшт 50.000\nНон 5*4500=20.000\nАброр 350.000\n```\n\n"
         "*/report* — текущий месяц\n"
         "*/report 6 2025* — июнь 2025\n"
         "*/list* — последние записи",

@@ -20,6 +20,7 @@ incomes = []
 balance_snapshots = []  # {date, cash, bank, chat_id} — остатки которые скидывает админ
 pending = {}
 ai_history = []  # история диалога с AI-ассистентом
+chat_last_date = {}  # {chat_id: "ДД.ММ.ГГГГ"} — последняя известная дата в каждом чате
 
 settings = {
     "categories": [
@@ -60,6 +61,7 @@ def main_kb(uid=None):
         [KeyboardButton("ℹ️ Помощь")]
     ]
     if uid == ADMIN_ID:
+        kb.insert(2, [KeyboardButton("📈 Отчёт по приходам")])
         kb.append([KeyboardButton("⚙️ Настройки")])
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
@@ -77,7 +79,8 @@ def period_kb(prefix="rep"):
         [InlineKeyboardButton("7 дней", callback_data=f"{prefix}:week"),
          InlineKeyboardButton("30 дней", callback_data=f"{prefix}:month30")],
         [InlineKeyboardButton("Текущий месяц", callback_data=f"{prefix}:curmonth"),
-         InlineKeyboardButton("Прошлый месяц", callback_data=f"{prefix}:prevmonth")]
+         InlineKeyboardButton("Прошлый месяц", callback_data=f"{prefix}:prevmonth")],
+        [InlineKeyboardButton("📅 Выбрать даты вручную", callback_data=f"{prefix}:calendar")]
     ]
     return InlineKeyboardMarkup(kb)
 
@@ -216,17 +219,70 @@ def get_period(key):
         return f.replace(day=1,hour=0,minute=0,second=0),f.replace(hour=23,minute=59,second=59),f"Прошлый {mn[f.month]}"
     return None,None,None
 
+# ─── ИЗВЛЕЧЕНИЕ ДАТЫ ИЗ ТЕКСТА ───────────────────────────────────────────────
+def extract_date_from_text(text):
+    """Ищет дату в тексте — поддерживает разные форматы"""
+    patterns = [
+        r'\b(\d{2})\.(\d{2})\.(\d{4})\b',           # 19.05.2026
+        r'\b(\d{1,2})\.(\d{2})\.(\d{4})\b',          # 9.05.2026
+        r'\b(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})\b', # 19-05-2026
+        r'\b(\d{1,2})\s+(январ|феврал|март|апрел|май|июн|июл|август|сентябр|октябр|ноябр|декабр)[а-я]*\s*\.?\s*(\d{4})\b',
+        r'\b(\d{1,2})\s+(январ|феврал|март|апрел|май|июн|июл|август|сентябр|октябр|ноябр|декабр)[а-я]*\b',
+        # Узбекские месяцы
+        r'\b(\d{1,2})\s*(yanvar|fevral|mart|aprel|may|iyun|iyul|avgust|sentabr|oktabr|noyabr|dekabr)[a-z]*\b',
+    ]
+    month_map = {
+        'январ':1,'феврал':2,'март':3,'апрел':4,'май':5,'июн':6,
+        'июл':7,'август':8,'сентябр':9,'октябр':10,'ноябр':11,'декабр':12,
+        'yanvar':1,'fevral':2,'mart':3,'aprel':4,'may':5,'iyun':6,
+        'iyul':7,'avgust':8,'sentabr':9,'oktabr':10,'noyabr':11,'dekabr':12,
+    }
+    text_lower = text.lower()
+    now = datetime.now()
+
+    # Числовые форматы
+    m = re.search(r'\b(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})\b', text)
+    if m:
+        try:
+            d = datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+            return d.strftime("%d.%m.%Y")
+        except: pass
+
+    # Формат ДД.ММ без года
+    m = re.search(r'\b(\d{1,2})\.(\d{1,2})\b', text)
+    if m:
+        try:
+            d = datetime(now.year, int(m.group(2)), int(m.group(1)))
+            return d.strftime("%d.%m.%Y")
+        except: pass
+
+    # Словесные месяцы
+    for rus_month, num in month_map.items():
+        pattern = rf'\b(\d{{1,2}})\s+{rus_month}'
+        m = re.search(pattern, text_lower)
+        if m:
+            try:
+                year = now.year
+                year_m = re.search(rf'{rus_month}[а-яa-z]*\s*(\d{{4}})', text_lower)
+                if year_m: year = int(year_m.group(1))
+                d = datetime(year, num, int(m.group(1)))
+                return d.strftime("%d.%m.%Y")
+            except: pass
+    return None
+
 # ─── AI ПАРСИНГ РАСХОДОВ ──────────────────────────────────────────────────────
-def parse_with_ai(text):
+def parse_with_ai(text, fallback_date=None):
     try:
         cats = ", ".join(settings["categories"])
         rules = "\n".join([f"- '{k}' → {v}" for k,v in settings["custom_rules"].items()])
         today = datetime.now().strftime("%d.%m.%Y")
+        default_date = fallback_date or today
         resp = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=1500,
             messages=[{"role":"user","content":f"""Ты помощник учёта расходов ресторана. Русский/узбекский.
 Сегодня: {today}
+ДАТА ПО УМОЛЧАНИЮ: {default_date}
 Правила: {rules}
 ФОТ имена: {', '.join(KNOWN_FOT)}
 
@@ -238,12 +294,16 @@ def parse_with_ai(text):
 - Такси → такси | Транспорт/тахи → транспорт | Газ → оплата за газ
 - Гўшт/мясо → мясо | Сут → сырьё | Нон → хлеб | Кола → кола
 - Телефон/Алиса/Сим расход → телефония | Шётка/щётка → сырьё
+- Лагмон хамир, хамир → сырьё | Кабель вай фай → телефония
+- Мева бозор → фрукты | Кандиянер/кондиционер → прочее
+- Пичок/нож → сырьё | Пепси/Колага/Кумир → напитки
 - "приход"/"тушум"/"касса" + сумма → type:income, payment_type:cash
-- "банк приход"/"банк келди" → type:income, payment_type:bank
+- "банк приход"/"банк келди"/"Гушга" + сумма → type:income
 - "банк" в расходе → payment_type:bank
-- Дата сверху сообщения → все строки этой даты
+- ВАЖНО: если в тексте НЕТ даты — используй ДАТУ ПО УМОЛЧАНИЮ: {default_date}
+- Если дата ЕСТЬ в тексте — используй её для ВСЕХ строк этого сообщения
 - Точки = тысячи: 50.000=50000 | Формула 57*3500 → результат
-- Прочерк без суммы → пропустить | "ужн"/"кейин" → пропустить
+- Прочерк без суммы → пропустить | "ужн"/"кейин"/"вибга ужн" → пропустить
 - Если непонятно → uncertain:true
 
 Сообщение: {text}"""}]
@@ -258,26 +318,21 @@ def parse_with_ai(text):
 async def ai_assistant(update: Update, context, text: str):
     """Свободный диалог с AI-ассистентом в личке"""
     chat_id = update.effective_chat.id
-
-    # Собираем контекст о текущих данных
     b = get_balance(chat_id)
     recent_exp = sorted(expenses, key=lambda x: x['date'], reverse=True)[:10]
     recent_inc = sorted(incomes, key=lambda x: x['date'], reverse=True)[:5]
 
     exp_summary = "\n".join([f"- {e['date']}: {e['category']} {e['amount']:,.0f} ({e['description'][:30]})" for e in recent_exp])
-    inc_summary = "\n".join([f"- {i['date']}: {i['type']} +{i['amount']:,.0f} ({i['description'][:30]})" for i in recent_inc])
+    inc_summary = "\n".join([f"- {i['date']}: {'🏦' if i['type']=='bank' else '💵'} +{i['amount']:,.0f} ({i['description'][:30]})" for i in recent_inc])
     rules_str = json.dumps(settings["custom_rules"], ensure_ascii=False)
     cats_str = ", ".join(settings["categories"])
     today = datetime.now().strftime("%d.%m.%Y")
+    history = ai_history[-8:] if len(ai_history) > 8 else ai_history
 
-    # История диалога (последние 6 сообщений)
-    history = ai_history[-6:] if len(ai_history) > 6 else ai_history
+    messages = history + [{"role":"user","content":f"""Сообщение от Жасура: {text}
 
-    messages = history + [{"role":"user","content":f"""Сообщение от администратора: {text}
-
-Текущий контекст:
-Баланс наличка: {b['cash_balance']:,.0f} сум
-Баланс банк: {b['bank_balance']:,.0f} сум
+Текущие данные:
+Баланс наличка: {b['cash_balance']:,.0f} | Баланс банк: {b['bank_balance']:,.0f}
 Последние расходы:
 {exp_summary}
 Последние приходы:
@@ -290,57 +345,78 @@ async def ai_assistant(update: Update, context, text: str):
         resp = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=1000,
-            system=f"""Ты финансовый ассистент ресторана Суром. Помогаешь администратору Жасуру управлять финансами.
+            system=f"""Ты финансовый ассистент ресторана Суром (Узбекистан). Помогаешь Жасуру управлять финансами.
+Общайся на русском языке. Будь краток и конкретен.
 
-Ты можешь:
-1. Отвечать на вопросы о расходах и балансе
-2. Если просят записать расход/приход — верни JSON в начале ответа: ACTION:{{...}}
-3. Если просят изменить категорию — верни: RULE:{{\"keyword\":\"...\",\"category\":\"...\"}}
-4. Если просят отчёт — дай текстовый анализ данных
-5. Советовать по финансам
+ТВОИ ВОЗМОЖНОСТИ:
+1. Записать расход/приход → верни в ответе: ACTION_EXP:{{...}} или ACTION_INC:{{...}}
+2. Изменить категорию → верни: ACTION_RULE:{{\"keyword\":\"...\",\"category\":\"...\"}}
+3. Если что-то непонятно → задай ОДИН уточняющий вопрос
+4. Анализировать финансы и давать советы
 
-Формат ACTION для записи расхода:
-ACTION:{{"type":"expense","amount":сумма,"category":"кат","description":"описание","date":"ДД.ММ.ГГГГ","payment_type":"cash"}}
+ФОРМАТЫ ACTION:
+ACTION_EXP:{{"amount":сумма,"category":"кат","description":"описание","date":"ДД.ММ.ГГГГ","payment_type":"cash"}}
+ACTION_INC:{{"amount":сумма,"type":"cash"/"bank","description":"описание","date":"ДД.ММ.ГГГГ"}}
+ACTION_RULE:{{"keyword":"слово","category":"категория"}}
 
-Отвечай кратко и по делу. На узбекском или русском — как пишет пользователь.""",
+ПРИМЕРЫ ПОНИМАНИЯ:
+- "запиши расход мясо 500000 за 24 мая" → ACTION_EXP с category:мясо, date:24.05.{today[-4:]}
+- "гушга 10800000 это приход в банк" → ACTION_INC с type:bank
+- "азиз 140000 это не приход, это ФОТ" → ACTION_EXP с category:ФОТ
+- "добавь правило: Мадина = 70%" → ACTION_RULE
+- "какой баланс" → текстовый ответ с анализом
+- "что за расход Бозор" → спроси уточнение если непонятно
+
+ПРАВИЛО УТОЧНЕНИЙ: если не понимаешь сумму, дату или категорию — задай ОДИН конкретный вопрос.
+Не задавай несколько вопросов сразу.""",
             messages=messages
         )
         answer = resp.content[0].text
 
-        # Сохраняем в историю
+        # Сохраняем историю
         ai_history.append({"role":"user","content":text})
         ai_history.append({"role":"assistant","content":answer})
 
-        # Обрабатываем ACTION
-        if "ACTION:" in answer:
-            action_match = re.search(r'ACTION:(\{[^}]+\})', answer)
-            if action_match:
-                try:
-                    action = json.loads(action_match.group(1))
-                    if action.get('type') == 'income':
-                        incomes.append({**action, 'chat_id': ADMIN_ID})
-                    else:
-                        expenses.append({**action, 'chat_id': ADMIN_ID})
-                    answer = re.sub(r'ACTION:\{[^}]+\}', '', answer).strip()
-                    answer += "\n\n✅ *Записано!*"
-                except: pass
+        # Обрабатываем ACTION_EXP
+        exp_match = re.search(r'ACTION_EXP:(\{[^}]+\})', answer)
+        if exp_match:
+            try:
+                action = json.loads(exp_match.group(1))
+                action['chat_id'] = ADMIN_ID
+                action.setdefault('user', 'Жасур')
+                expenses.append(action)
+                answer = re.sub(r'ACTION_EXP:\{[^}]+\}', '', answer).strip()
+                cat = action.get('category','')
+                answer += f"\n\n✅ *Расход записан!*\n{EMOJI.get(cat,'📌')} {cat}: {float(action.get('amount',0)):,.0f} сум"
+            except: pass
 
-        # Обрабатываем RULE
-        if "RULE:" in answer:
-            rule_match = re.search(r'RULE:(\{[^}]+\})', answer)
-            if rule_match:
-                try:
-                    rule = json.loads(rule_match.group(1))
-                    settings["custom_rules"][rule['keyword'].lower()] = rule['category']
-                    answer = re.sub(r'RULE:\{[^}]+\}', '', answer).strip()
-                    answer += f"\n\n✅ *Правило добавлено:* `{rule['keyword']}` → {rule['category']}"
-                except: pass
+        # Обрабатываем ACTION_INC
+        inc_match = re.search(r'ACTION_INC:(\{[^}]+\})', answer)
+        if inc_match:
+            try:
+                action = json.loads(inc_match.group(1))
+                action['chat_id'] = ADMIN_ID
+                incomes.append(action)
+                answer = re.sub(r'ACTION_INC:\{[^}]+\}', '', answer).strip()
+                tp = "🏦 Банк" if action.get('type')=='bank' else "💵 Наличка"
+                answer += f"\n\n✅ *Приход записан!*\n{tp}: {float(action.get('amount',0)):,.0f} сум"
+            except: pass
 
-        await update.message.reply_text(answer, parse_mode="Markdown")
+        # Обрабатываем ACTION_RULE
+        rule_match = re.search(r'ACTION_RULE:(\{[^}]+\})', answer)
+        if rule_match:
+            try:
+                rule = json.loads(rule_match.group(1))
+                settings["custom_rules"][rule['keyword'].lower()] = rule['category']
+                answer = re.sub(r'ACTION_RULE:\{[^}]+\}', '', answer).strip()
+                answer += f"\n\n✅ *Правило добавлено:* `{rule['keyword']}` → {rule['category']}"
+            except: pass
+
+        await update.message.reply_text(answer.strip(), parse_mode="Markdown")
 
     except Exception as e:
         logger.error(f"AI assistant: {e}")
-        await update.message.reply_text("❌ Ошибка AI. Попробуйте ещё раз.")
+        await update.message.reply_text("❌ Ошибка. Попробуйте ещё раз.")
 
 # ─── EXCEL ────────────────────────────────────────────────────────────────────
 def generate_excel(ce, ci):
@@ -457,7 +533,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_balance(update, context); return
     elif text == "📋 Последние записи":
         await show_list(update, context); return
-    elif text == "🔍 Детализация":
+    elif text == "📈 Отчёт по приходам":
+        if uid != ADMIN_ID: return
+        await show_income_report(update, context); return
         kb = cat_detail_kb(chat_id)
         if kb.inline_keyboard: await update.message.reply_text("Выберите категорию:", reply_markup=kb)
         else: await update.message.reply_text("📭 Нет записей.")
@@ -503,8 +581,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text.startswith('/'): return
 
+    # ─── Обновляем последнюю известную дату для чата ───
+    found_date = extract_date_from_text(text)
+    if found_date:
+        chat_last_date[chat_id] = found_date
+
+    # Дата по умолчанию = последняя известная дата чата
+    fallback = chat_last_date.get(chat_id)
+
     # ─── Обработка расходов ───
-    items = parse_with_ai(text)
+    items = parse_with_ai(text, fallback_date=fallback)
     if not items: return
 
     saved_exp, saved_inc, uncertain_items = [], [], []
@@ -549,16 +635,94 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    d = q.data; chat_id = q.message.chat_id
+    d = q.data; chat_id = q.message.chat_id; uid = q.from_user.id
 
+    # ─── Отчёт по периоду ───
     if d.startswith("rep:"):
-        df,dt,title = get_period(d.replace("rep:",""))
+        key = d.replace("rep:","")
+        if key == "calendar":
+            now = datetime.now()
+            context.user_data['cal_mode'] = 'rep'
+            context.user_data['cal_step'] = 'from'
+            await q.edit_message_text("📅 Выберите *начальную* дату:", parse_mode="Markdown",
+                reply_markup=calendar_kb(now.year, now.month, "from"))
+            return
+        df,dt,title = get_period(key)
         if df: await q.edit_message_text(make_report(title,chat_id,df,dt), parse_mode="Markdown")
 
     elif d.startswith("flow:"):
-        df,dt,title = get_period(d.replace("flow:",""))
+        key = d.replace("flow:","")
+        if key == "calendar":
+            now = datetime.now()
+            context.user_data['cal_mode'] = 'flow'
+            context.user_data['cal_step'] = 'from'
+            await q.edit_message_text("📅 Выберите *начальную* дату:", parse_mode="Markdown",
+                reply_markup=calendar_kb(now.year, now.month, "from"))
+            return
+        df,dt,title = get_period(key)
         if df: await q.edit_message_text(make_cashflow(chat_id,df,dt,title), parse_mode="Markdown")
 
+    # ─── Календарь ───
+    elif d.startswith("cal:"):
+        parts = d.split(":")
+        action = parts[1]
+
+        if action == "ignore": return
+        if action == "cancel":
+            await q.edit_message_text("❌ Отменено.")
+            context.user_data.pop('cal_mode', None)
+            context.user_data.pop('cal_step', None)
+            context.user_data.pop('cal_from', None)
+            return
+
+        if action in ("prev", "next"):
+            year, month = int(parts[2]), int(parts[3])
+            mode = parts[4]
+            if action == "prev":
+                month -= 1
+                if month < 1: month = 12; year -= 1
+            else:
+                month += 1
+                if month > 12: month = 1; year += 1
+            label = "начальную" if mode == "from" else "конечную"
+            await q.edit_message_text(f"📅 Выберите *{label}* дату:", parse_mode="Markdown",
+                reply_markup=calendar_kb(year, month, mode))
+            return
+
+        if action == "day":
+            year, month, day = int(parts[2]), int(parts[3]), int(parts[4])
+            mode = parts[5]
+            selected = datetime(year, month, day)
+            selected_str = selected.strftime("%d.%m.%Y")
+
+            if mode == "from":
+                context.user_data['cal_from'] = selected
+                context.user_data['cal_step'] = 'to'
+                await q.edit_message_text(
+                    f"✅ Начало: *{selected_str}*\n\n📅 Теперь выберите *конечную* дату:",
+                    parse_mode="Markdown",
+                    reply_markup=calendar_kb(year, month, "to"))
+            else:
+                # Конечная дата выбрана — строим отчёт
+                d_from = context.user_data.get('cal_from')
+                d_to = selected.replace(hour=23, minute=59, second=59)
+                cal_mode = context.user_data.get('cal_mode', 'rep')
+
+                if d_from and d_to >= d_from:
+                    title = f"{d_from.strftime('%d.%m')} — {d_to.strftime('%d.%m.%Y')}"
+                    if cal_mode == 'rep':
+                        report = make_report(title, chat_id, d_from, d_to)
+                    else:
+                        report = make_cashflow(chat_id, d_from, d_to, title)
+                    await q.edit_message_text(report, parse_mode="Markdown")
+                else:
+                    await q.edit_message_text("❌ Конечная дата должна быть позже начальной. Попробуйте снова.")
+
+                context.user_data.pop('cal_mode', None)
+                context.user_data.pop('cal_step', None)
+                context.user_data.pop('cal_from', None)
+
+    # ─── Детализация ───
     elif d.startswith("det:"):
         cat = d.replace("det:","")
         cat_exps = [e for e in expenses if e['chat_id']==chat_id and e['category']==cat]
@@ -590,7 +754,53 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"✅ `{kw}` → *{cat}*", parse_mode="Markdown")
         context.user_data['state']=None; context.user_data['rule_kw']=None
 
-async def show_balance(update, context):
+async def show_income_report(update, context):
+    chat_id = update.effective_chat.id
+    if not incomes and not expenses:
+        await update.message.reply_text("📭 Нет данных."); return
+
+    ci = [i for i in incomes if i['chat_id'] == chat_id]
+    ce = [e for e in expenses if e['chat_id'] == chat_id]
+
+    # Приходы по типу
+    cash_in = sum(i['amount'] for i in ci if i['type'] == 'cash')
+    bank_in = sum(i['amount'] for i in ci if i['type'] == 'bank')
+    total_in = cash_in + bank_in
+
+    # Расходы по типу
+    cash_out = sum(e['amount'] for e in ce if e.get('payment_type','cash') == 'cash')
+    bank_out = sum(e['amount'] for e in ce if e.get('payment_type','bank') == 'bank')
+    total_out = cash_out + bank_out
+
+    net = total_in - total_out
+
+    # Последние приходы
+    recent_inc = sorted(ci, key=lambda x: x['date'], reverse=True)[:10]
+    inc_lines = "\n".join([
+        f"📆 {i['date']} | {'🏦' if i['type']=='bank' else '💵'} {i['amount']:,.0f} | {i['description'][:30]}"
+        for i in recent_inc
+    ]) or "_(нет записей)_"
+
+    sign = "+" if net >= 0 else ""
+    color = "🟢" if net >= 0 else "🔴"
+
+    text = (
+        f"📈 *Отчёт по приходам*\n\n"
+        f"*ПРИХОДЫ:*\n"
+        f"💵 Наличка: {cash_in:,.0f} сум\n"
+        f"🏦 Банк: {bank_in:,.0f} сум\n"
+        f"📥 *Итого приход: {total_in:,.0f} сум*\n\n"
+        f"*РАСХОДЫ:*\n"
+        f"💵 Наличка: {cash_out:,.0f} сум\n"
+        f"🏦 Банк: {bank_out:,.0f} сум\n"
+        f"📤 *Итого расход: {total_out:,.0f} сум*\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"{color} *Чистый остаток: {sign}{net:,.0f} сум*\n\n"
+        f"*Последние приходы:*\n{inc_lines}"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
     b = get_balance(update.effective_chat.id)
     cash_sign = "🟢" if b['cash_balance']>=0 else "🔴"
     bank_sign = "🟢" if b['bank_balance']>=0 else "🔴"
@@ -658,3 +868,36 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ═══════════════════════════════════════════════════════════════════
+# CALENDAR MODULE — мини-календарь для выбора периода
+# ═══════════════════════════════════════════════════════════════════
+
+def calendar_kb(year, month, mode="from"):
+    """Генерирует inline-клавиатуру с календарём"""
+    import calendar
+    month_names = {1:"Январь",2:"Февраль",3:"Март",4:"Апрель",5:"Май",6:"Июнь",
+                   7:"Июль",8:"Август",9:"Сентябрь",10:"Октябрь",11:"Ноябрь",12:"Декабрь"}
+    kb = []
+    # Заголовок с навигацией
+    kb.append([
+        InlineKeyboardButton("◀️", callback_data=f"cal:prev:{year}:{month}:{mode}"),
+        InlineKeyboardButton(f"{month_names[month]} {year}", callback_data="cal:ignore"),
+        InlineKeyboardButton("▶️", callback_data=f"cal:next:{year}:{month}:{mode}")
+    ])
+    # Дни недели
+    kb.append([InlineKeyboardButton(d, callback_data="cal:ignore") for d in ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]])
+    # Дни месяца
+    cal = calendar.monthcalendar(year, month)
+    for week in cal:
+        row = []
+        for day in week:
+            if day == 0:
+                row.append(InlineKeyboardButton(" ", callback_data="cal:ignore"))
+            else:
+                row.append(InlineKeyboardButton(str(day), callback_data=f"cal:day:{year}:{month}:{day}:{mode}"))
+        kb.append(row)
+    # Кнопка отмены
+    kb.append([InlineKeyboardButton("❌ Отмена", callback_data="cal:cancel")])
+    return InlineKeyboardMarkup(kb)
+

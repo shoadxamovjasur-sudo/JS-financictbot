@@ -87,7 +87,7 @@ def parse_expense_with_ai(text):
     try:
         categories_str = ", ".join(CATEGORIES)
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-haiku-4-5-20251001",
             max_tokens=800,
             messages=[{"role": "user", "content": f"""Ты помощник учёта расходов ресторана. Текст на русском или узбекском.
 

@@ -57,7 +57,7 @@ def main_keyboard(user_id=None):
     ]
     if user_id == ADMIN_ID:
         keyboard.append([KeyboardButton("⚙️ Настройки администратора")])
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, persistent=True)
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def admin_keyboard():
     keyboard = [

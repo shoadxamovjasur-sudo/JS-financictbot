@@ -56,8 +56,8 @@ EMOJI = {
 def main_kb(uid=None):
     kb = [
         [KeyboardButton("📊 Отчёт"), KeyboardButton("💸 Движение средств")],
-        [KeyboardButton("💰 Баланс"), KeyboardButton("📋 Последние записи")],
-        [KeyboardButton("🔍 Детализация"), KeyboardButton("📥 Excel")],
+        [KeyboardButton("💰 Баланс"), KeyboardButton("🔍 Детализация")],
+        [KeyboardButton("📥 Excel")],
         [KeyboardButton("ℹ️ Помощь")]
     ]
     if uid == ADMIN_ID:
@@ -84,12 +84,16 @@ def period_kb(prefix="rep"):
     ]
     return InlineKeyboardMarkup(kb)
 
+detail_cats_cache = {}  # {chat_id: [категории]} — кэш для детализации
+
 def cat_detail_kb(chat_id):
-    cats = list({e['category'] for e in expenses if e['chat_id'] == chat_id})
+    cats = sorted({e['category'] for e in expenses if e['chat_id'] == chat_id})
+    detail_cats_cache[chat_id] = cats
     kb = []; row = []
-    for cat in sorted(cats):
-        row.append(InlineKeyboardButton(cat, callback_data=f"det:{cat}"))
-        if len(row) == 3: kb.append(row); row = []
+    for idx, cat in enumerate(cats):
+        cnt = len([e for e in expenses if e['chat_id']==chat_id and e['category']==cat])
+        row.append(InlineKeyboardButton(f"{cat} ({cnt})", callback_data=f"det:{idx}"))
+        if len(row) == 2: kb.append(row); row = []
     if row: kb.append(row)
     return InlineKeyboardMarkup(kb)
 
@@ -297,8 +301,10 @@ def parse_with_ai(text, fallback_date=None):
 - Лагмон хамир, хамир → сырьё | Кабель вай фай → телефония
 - Мева бозор → фрукты | Кандиянер/кондиционер → прочее
 - Пичок/нож → сырьё | Пепси/Колага/Кумир → напитки
-- "приход"/"тушум"/"касса" + сумма → type:income, payment_type:cash
-- "банк приход"/"банк келди"/"Гушга" + сумма → type:income
+- КРИТИЧЕСКОЕ ПРАВИЛО ПРИХОДА: type:income ТОЛЬКО если в строке ЯВНО написано слово "приход"/"ПРИХОД"/"тушум". Все остальные строки — ВСЕГДА type:expense, даже если похоже на доход!
+- "приход 5000000" → income, payment_type:cash
+- "приход банк 5000000" / "банк приход" → income, payment_type:bank
+- Любая строка БЕЗ слова "приход" — это РАСХОД (expense)
 - "банк" в расходе → payment_type:bank
 - ВАЖНО: если в тексте НЕТ даты — используй ДАТУ ПО УМОЛЧАНИЮ: {default_date}
 - Если дата ЕСТЬ в тексте — используй её для ВСЕХ строк этого сообщения
@@ -345,8 +351,15 @@ async def ai_assistant(update: Update, context, text: str):
         resp = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=1000,
-            system=f"""Ты финансовый ассистент ресторана Суром (Узбекистан). Помогаешь Жасуру управлять финансами.
-Общайся на русском языке. Будь краток и конкретен.
+            system=f"""Ты — элитный финансовый директор и главный бухгалтер ресторана Суром (Узбекистан). 
+Твой работодатель — Жасур. Ты совершенный профессионал: точный, внимательный к деталям, проактивный.
+
+ТВОЙ ХАРАКТЕР:
+- Точность бухгалтера: каждая цифра имеет значение
+- Мышление финансового аналитика: замечаешь аномалии, тренды, риски
+- Проактивность: если видишь проблему в данных — сразу говоришь
+- Краткость: ответ по существу, без воды
+- Общение на русском языке
 
 ТВОИ ВОЗМОЖНОСТИ:
 1. Записать расход/приход → верни в ответе: ACTION_EXP:{{...}} или ACTION_INC:{{...}}
@@ -484,7 +497,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "☪️ *Ассаламу алейкум!*\n\n"
             "Я — *профессиональный бот-финансист* 🤖💼\n\n"
-            "Создан Жасуром. Просто отправляйте отчёты!\n\n"
+            "Создан для группы *Суром*. Просто отправляйте отчёты!\n\n"
             "📝 Пример:\n"
             "```\n24.05.2026\nГўшт 50.000\nАброр 350.000\nТакси 30.000\n```",
             parse_mode="Markdown", reply_markup=main_kb(uid))
@@ -531,8 +544,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Выберите период:", reply_markup=period_kb("flow")); return
     elif text == "💰 Баланс":
         await show_balance(update, context); return
-    elif text == "📋 Последние записи":
-        await show_list(update, context); return
     elif text == "📈 Отчёт по приходам":
         if uid != ADMIN_ID: return
         await show_income_report(update, context); return
@@ -600,10 +611,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: datetime.strptime(item_date, "%d.%m.%Y")
         except: item_date = datetime.now().strftime("%d.%m.%Y")
 
-        if item.get('type') == 'income':
+        # ЗАЩИТА: приход только если слово "приход"/"тушум" есть в оригинальном тексте
+        text_low = text.lower()
+        is_income_allowed = 'приход' in text_low or 'тушум' in text_low
+        if item.get('type') == 'income' and is_income_allowed:
             inc = {'date':item_date,'amount':float(item['amount']),'type':item.get('payment_type','cash'),'description':item.get('description','')[:100],'chat_id':chat_id}
             incomes.append(inc); saved_inc.append(inc)
         else:
+            # Income без слова "приход" в тексте конвертируется в расход
             exp = {'date':item_date,'amount':float(item['amount']),'category':item.get('category') or 'прочее','description':item.get('description','')[:100],'user':update.message.from_user.first_name or "—",'chat_id':chat_id,'payment_type':item.get('payment_type','cash')}
             if item.get('uncertain') or not item.get('category'): uncertain_items.append(exp)
             else: expenses.append(exp); saved_exp.append(exp)
@@ -632,6 +647,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown", reply_markup=cat_assign_kb(pid))
         except Exception as e:
             exp['category'] = 'прочее'; expenses.append(exp)
+
+# ═══════════════════════════════════════════════════════════════════
+# CALENDAR MODULE — мини-календарь для выбора периода
+# ═══════════════════════════════════════════════════════════════════
+
+def calendar_kb(year, month, mode="from"):
+    """Генерирует inline-клавиатуру с календарём"""
+    import calendar
+    month_names = {1:"Январь",2:"Февраль",3:"Март",4:"Апрель",5:"Май",6:"Июнь",
+                   7:"Июль",8:"Август",9:"Сентябрь",10:"Октябрь",11:"Ноябрь",12:"Декабрь"}
+    kb = []
+    # Заголовок с навигацией
+    kb.append([
+        InlineKeyboardButton("◀️", callback_data=f"cal:prev:{year}:{month}:{mode}"),
+        InlineKeyboardButton(f"{month_names[month]} {year}", callback_data="cal:ignore"),
+        InlineKeyboardButton("▶️", callback_data=f"cal:next:{year}:{month}:{mode}")
+    ])
+    # Дни недели
+    kb.append([InlineKeyboardButton(d, callback_data="cal:ignore") for d in ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]])
+    # Дни месяца
+    cal = calendar.monthcalendar(year, month)
+    for week in cal:
+        row = []
+        for day in week:
+            if day == 0:
+                row.append(InlineKeyboardButton(" ", callback_data="cal:ignore"))
+            else:
+                row.append(InlineKeyboardButton(str(day), callback_data=f"cal:day:{year}:{month}:{day}:{mode}"))
+        kb.append(row)
+    # Кнопка отмены
+    kb.append([InlineKeyboardButton("❌ Отмена", callback_data="cal:cancel")])
+    return InlineKeyboardMarkup(kb)
+
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -724,16 +772,27 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ─── Детализация ───
     elif d.startswith("det:"):
-        cat = d.replace("det:","")
+        try:
+            idx = int(d.replace("det:",""))
+            cats = detail_cats_cache.get(chat_id, [])
+            if idx >= len(cats):
+                await q.edit_message_text("❌ Список устарел. Нажмите Детализация снова."); return
+            cat = cats[idx]
+        except:
+            await q.edit_message_text("❌ Ошибка. Попробуйте снова."); return
         cat_exps = [e for e in expenses if e['chat_id']==chat_id and e['category']==cat]
-        if not cat_exps: await q.edit_message_text(f"📭 Нет записей в *{cat}*", parse_mode="Markdown"); return
+        if not cat_exps:
+            await q.edit_message_text(f"📭 Нет записей в категории {cat}"); return
         total = sum(e['amount'] for e in cat_exps)
-        lines = [f"🔍 *Детализация: {cat}*\n"]
-        for e in sorted(cat_exps, key=lambda x:x['date'], reverse=True)[:20]:
+        lines = [f"🔍 Детализация: {cat}", ""]
+        for e in sorted(cat_exps, key=lambda x:x['date'], reverse=True)[:30]:
             pt = "🏦" if e.get('payment_type')=='bank' else "💵"
-            lines.append(f"📆 {e['date']} {pt} {e['amount']:,.0f} | {e['description'][:30]}")
-        lines += ["","━━━━━━━━━━━━━━━",f"💰 *Итого: {total:,.0f} сум* ({len(cat_exps)} записей)"]
-        await q.edit_message_text("\n".join(lines), parse_mode="Markdown")
+            who = e.get('user','')[:10]
+            lines.append(f"📆 {e['date']} {pt} {e['amount']:,.0f} сум")
+            lines.append(f"   └ {e['description'][:40]} ({who})")
+        lines += ["","━━━━━━━━━━━━━━━",f"💰 Итого: {total:,.0f} сум",f"📝 Записей: {len(cat_exps)}"]
+        # Отправляем без Markdown чтобы избежать ошибок парсинга
+        await q.edit_message_text("\n".join(lines))
 
     elif d.startswith("asgn:"):
         parts=d.split(":",2); pid=parts[1]; cat=parts[2]
@@ -868,36 +927,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# ═══════════════════════════════════════════════════════════════════
-# CALENDAR MODULE — мини-календарь для выбора периода
-# ═══════════════════════════════════════════════════════════════════
-
-def calendar_kb(year, month, mode="from"):
-    """Генерирует inline-клавиатуру с календарём"""
-    import calendar
-    month_names = {1:"Январь",2:"Февраль",3:"Март",4:"Апрель",5:"Май",6:"Июнь",
-                   7:"Июль",8:"Август",9:"Сентябрь",10:"Октябрь",11:"Ноябрь",12:"Декабрь"}
-    kb = []
-    # Заголовок с навигацией
-    kb.append([
-        InlineKeyboardButton("◀️", callback_data=f"cal:prev:{year}:{month}:{mode}"),
-        InlineKeyboardButton(f"{month_names[month]} {year}", callback_data="cal:ignore"),
-        InlineKeyboardButton("▶️", callback_data=f"cal:next:{year}:{month}:{mode}")
-    ])
-    # Дни недели
-    kb.append([InlineKeyboardButton(d, callback_data="cal:ignore") for d in ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]])
-    # Дни месяца
-    cal = calendar.monthcalendar(year, month)
-    for week in cal:
-        row = []
-        for day in week:
-            if day == 0:
-                row.append(InlineKeyboardButton(" ", callback_data="cal:ignore"))
-            else:
-                row.append(InlineKeyboardButton(str(day), callback_data=f"cal:day:{year}:{month}:{day}:{mode}"))
-        kb.append(row)
-    # Кнопка отмены
-    kb.append([InlineKeyboardButton("❌ Отмена", callback_data="cal:cancel")])
-    return InlineKeyboardMarkup(kb)
 

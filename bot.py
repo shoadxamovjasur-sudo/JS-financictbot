@@ -22,6 +22,47 @@ pending = {}
 ai_history = []  # история диалога с AI-ассистентом
 chat_last_date = {}  # {chat_id: "ДД.ММ.ГГГГ"} — последняя известная дата в каждом чате
 
+
+# ─── БАЗА ДАННЫХ (сохранение между перезапусками) ────────────────────────────
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+DB_FILE = "/app/data.json"  # резервный файл если нет БД
+
+def save_data():
+    """Сохраняет все данные в файл (переживает перезапуск если диск постоянный)"""
+    try:
+        data = {
+            "expenses": expenses,
+            "incomes": incomes,
+            "balance_snapshots": balance_snapshots,
+            "custom_rules": settings["custom_rules"],
+            "categories": settings["categories"],
+            "chat_last_date": chat_last_date
+        }
+        with open(DB_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Save error: {e}")
+
+def load_data():
+    """Загружает данные при старте"""
+    global expenses, incomes, balance_snapshots, chat_last_date
+    try:
+        if os.path.exists(DB_FILE):
+            with open(DB_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            expenses.extend(data.get("expenses", []))
+            incomes.extend(data.get("incomes", []))
+            balance_snapshots.extend(data.get("balance_snapshots", []))
+            settings["custom_rules"].update(data.get("custom_rules", {}))
+            for c in data.get("categories", []):
+                if c not in settings["categories"]:
+                    settings["categories"].append(c)
+            chat_last_date.update(data.get("chat_last_date", {}))
+            logger.info(f"Loaded {len(expenses)} expenses, {len(incomes)} incomes")
+    except Exception as e:
+        logger.error(f"Load error: {e}")
+
+
 settings = {
     "categories": [
         "мясо","напитки","кола","сырьё","оплата за газ","рис","ФОТ",
@@ -33,7 +74,8 @@ settings = {
     ],
     "custom_rules": {
         "азиз":"Азиз","султон мурод":"Султонмурод",
-        "султонмурод":"Султонмурод","шохрух":"70%"
+        "султонмурод":"Султонмурод","шохрух":"70%",
+        "бозор":"сырьё","базар":"сырьё","мева бозор":"сырьё"
     }
 }
 
@@ -274,6 +316,31 @@ def extract_date_from_text(text):
             except: pass
     return None
 
+
+# ─── ПРОВЕРКА АНОМАЛИЙ ────────────────────────────────────────────────────────
+# Типичные максимумы по категориям (сум). Если расход сильно выше — это подозрительно
+CATEGORY_LIMITS = {
+    "фрукты": 3_000_000,      # фрукты редко больше 3 млн за раз
+    "хлеб": 1_000_000,        # хлеб обычно до 1 млн
+    "напитки": 5_000_000,
+    "кола": 3_000_000,
+    "савзи": 2_000_000,
+    "масло": 5_000_000,
+    "рыба": 5_000_000,
+    "оплата за газ": 3_000_000,
+    "телефония": 3_000_000,
+    "соленые тилла": 3_000_000,
+    "посуда": 5_000_000,
+    "благоустройство": 10_000_000,
+}
+
+def check_anomaly(category, amount):
+    """Проверяет логичность суммы для категории. Возвращает причину если аномалия."""
+    limit = CATEGORY_LIMITS.get(category)
+    if limit and amount > limit:
+        return f"Сумма {amount:,.0f} сум очень большая для категории «{category}» (обычно до {limit:,.0f})"
+    return None
+
 # ─── AI ПАРСИНГ РАСХОДОВ ──────────────────────────────────────────────────────
 def parse_with_ai(text, fallback_date=None):
     try:
@@ -296,10 +363,14 @@ def parse_with_ai(text, fallback_date=None):
 Категории: {cats}
 - Имена из ФОТ → ФОТ | Азиз → Азиз | Султон Мурод → Султонмурод | Шохрух → 70%
 - Такси → такси | Транспорт/тахи → транспорт | Газ → оплата за газ
-- Гўшт/мясо → мясо | Сут → сырьё | Нон → хлеб | Кола → кола
+- Гўшт/мясо → мясо | Сут → сырьё | Кола → кола
+- ХЛЕБ: ТОЛЬКО слово "Нон" или "хлеб" → хлеб. БОЛЬШЕ НИЧЕГО в хлеб не относить!
+- БОЗОР (любой: Бозор, базар, рынок) → сырьё (НЕ фрукты!)
+- ФРУКТЫ: только конкретные фрукты — урик(абрикос), тарвуз(арбуз), гулос(слива), олма(яблоко), узум(виноград), банан, апельсин. "Мева" одиночное → фрукты
+- Мева бозор → сырьё (потому что бозор = закупка продуктов)
 - Телефон/Алиса/Сим расход → телефония | Шётка/щётка → сырьё
 - Лагмон хамир, хамир → сырьё | Кабель вай фай → телефония
-- Мева бозор → фрукты | Кандиянер/кондиционер → прочее
+- Кандиянер/кондиционер → прочее
 - Пичок/нож → сырьё | Пепси/Колага/Кумир → напитки
 - КРИТИЧЕСКОЕ ПРАВИЛО ПРИХОДА: type:income ТОЛЬКО если в строке ЯВНО написано слово "приход"/"ПРИХОД"/"тушум". Все остальные строки — ВСЕГДА type:expense, даже если похоже на доход!
 - "приход 5000000" → income, payment_type:cash
@@ -604,7 +675,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     items = parse_with_ai(text, fallback_date=fallback)
     if not items: return
 
-    saved_exp, saved_inc, uncertain_items = [], [], []
+    saved_exp, saved_inc, uncertain_items, anomaly_items = [], [], [], []
     for item in items:
         if not item.get('found') or not item.get('amount'): continue
         item_date = item.get('date', datetime.now().strftime("%d.%m.%Y"))
@@ -620,8 +691,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             # Income без слова "приход" в тексте конвертируется в расход
             exp = {'date':item_date,'amount':float(item['amount']),'category':item.get('category') or 'прочее','description':item.get('description','')[:100],'user':update.message.from_user.first_name or "—",'chat_id':chat_id,'payment_type':item.get('payment_type','cash')}
-            if item.get('uncertain') or not item.get('category'): uncertain_items.append(exp)
-            else: expenses.append(exp); saved_exp.append(exp)
+            # Проверка аномалии суммы
+            anomaly = check_anomaly(exp['category'], exp['amount'])
+            if item.get('uncertain') or not item.get('category'):
+                uncertain_items.append(exp)
+            elif anomaly:
+                # Подозрительная сумма — спросить админа
+                anomaly_items.append((exp, anomaly))
+            else:
+                expenses.append(exp); saved_exp.append(exp)
 
     lines = []
     for i in saved_inc:
@@ -638,6 +716,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"💰 *Итого: {sum(e['amount'] for e in saved_exp):,.0f} сум*")
     if lines:
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    if saved_exp or saved_inc:
+        save_data()
 
     for exp in uncertain_items:
         pid = str(uuid.uuid4())[:8]; pending[pid] = exp
@@ -645,6 +725,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=ADMIN_ID,
                 text=f"❓ *Не понял категорию!*\n\n📝 *{exp['description']}*\n💵 {exp['amount']:,.0f} сум | 📆 {exp['date']}\n👤 {exp['user']}\n\nВыберите категорию:",
                 parse_mode="Markdown", reply_markup=cat_assign_kb(pid))
+        except Exception as e:
+            exp['category'] = 'прочее'; expenses.append(exp)
+
+    # Аномальные суммы — спросить подтверждение у админа
+    for exp, reason in anomaly_items:
+        pid = str(uuid.uuid4())[:8]
+        pending[pid] = exp
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Да, всё верно", callback_data=f"anok:{pid}")],
+            [InlineKeyboardButton("🔧 Изменить категорию", callback_data=f"anfix:{pid}")],
+            [InlineKeyboardButton("🗑 Удалить", callback_data=f"skip:{pid}")]
+        ])
+        try:
+            await context.bot.send_message(chat_id=ADMIN_ID,
+                text=f"⚠️ *Подозрительная сумма!*\n\n"
+                     f"📝 {exp['description']}\n"
+                     f"{EMOJI.get(exp['category'],'📌')} Категория: *{exp['category']}*\n"
+                     f"💵 Сумма: *{exp['amount']:,.0f} сум*\n"
+                     f"📆 {exp['date']} | 👤 {exp['user']}\n\n"
+                     f"🤔 {reason}\n\n"
+                     f"Это правильно?",
+                parse_mode="Markdown", reply_markup=kb)
         except Exception as e:
             exp['category'] = 'прочее'; expenses.append(exp)
 
@@ -800,12 +902,32 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             exp=pending.pop(pid); exp['category']=cat; expenses.append(exp)
             kw = exp['description'].lower().split()[0] if exp['description'] else ''
             if kw and len(kw)>2: settings["custom_rules"][kw]=cat
+            save_data()
             await q.edit_message_text(f"✅ {EMOJI.get(cat,'📌')} *{cat}*\n💵 {exp['amount']:,.0f} сум\n📌 Правило: `{kw}` → {cat}", parse_mode="Markdown")
+
+    elif d.startswith("anok:"):
+        pid = d.replace("anok:","")
+        if pid in pending:
+            exp = pending.pop(pid)
+            expenses.append(exp)
+            save_data()
+            await q.edit_message_text(
+                f"✅ Подтверждено!\n{EMOJI.get(exp['category'],'📌')} {exp['category']}: {exp['amount']:,.0f} сум")
+        else:
+            await q.edit_message_text("✅ Уже обработано.")
+
+    elif d.startswith("anfix:"):
+        pid = d.replace("anfix:","")
+        if pid in pending:
+            await q.edit_message_text("Выберите правильную категорию:",
+                reply_markup=cat_assign_kb(pid))
+        else:
+            await q.edit_message_text("Уже обработано.")
 
     elif d.startswith("skip:"):
         pid=d.replace("skip:","")
         if pid in pending: pending.pop(pid)
-        await q.edit_message_text("🗑 Пропущено.")
+        await q.edit_message_text("🗑 Удалено.")
 
     elif d.startswith("setrule:"):
         cat=d.replace("setrule:",""); kw=context.user_data.get('rule_kw','')
@@ -918,6 +1040,7 @@ async def show_help(update, context):
         parse_mode="Markdown", reply_markup=main_kb(update.effective_user.id))
 
 def main():
+    load_data()  # Загружаем сохранённые данные
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(callback_handler))

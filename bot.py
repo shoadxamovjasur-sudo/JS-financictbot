@@ -343,55 +343,77 @@ def check_anomaly(category, amount):
 
 # ─── AI ПАРСИНГ РАСХОДОВ ──────────────────────────────────────────────────────
 def parse_with_ai(text, fallback_date=None):
+    import time
     try:
         cats = ", ".join(settings["categories"])
         rules = "\n".join([f"- '{k}' → {v}" for k,v in settings["custom_rules"].items()])
         today = datetime.now().strftime("%d.%m.%Y")
         default_date = fallback_date or today
-        resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1500,
-            messages=[{"role":"user","content":f"""Ты помощник учёта расходов ресторана. Русский/узбекский.
+        fot = ', '.join(KNOWN_FOT)
+
+        prompt = f"""Ты помощник учёта расходов ресторана. Русский/узбекский.
 Сегодня: {today}
 ДАТА ПО УМОЛЧАНИЮ: {default_date}
 Правила: {rules}
-ФОТ имена: {', '.join(KNOWN_FOT)}
+ФОТ имена: {fot}
 
-Верни ТОЛЬКО JSON массив:
-[{{"type":"expense"/"income","amount":число,"category":"кат или null","description":"описание","date":"ДД.ММ.ГГГГ","payment_type":"cash"/"bank","uncertain":bool,"found":true}}]
+Верни ТОЛЬКО JSON массив (ничего кроме JSON!):
+[{{"type":"expense"/"income","amount":число,"category":"кат или null","description":"описание","date":"ДД.ММ.ГГГГ","payment_type":"cash"/"bank","uncertain":false,"found":true}}]
 
 Категории: {cats}
 - Имена из ФОТ → ФОТ | Азиз → Азиз | Султон Мурод → Султонмурод | Шохрух → 70%
 - Такси → такси | Транспорт/тахи → транспорт | Газ → оплата за газ
 - Гўшт/мясо → мясо | Сут → сырьё | Кола → кола
-- ХЛЕБ: ТОЛЬКО слово "Нон" или "хлеб" → хлеб. БОЛЬШЕ НИЧЕГО в хлеб не относить!
-- БОЗОР (любой: Бозор, базар, рынок) → сырьё (НЕ фрукты!)
-- ФРУКТЫ: только конкретные фрукты — урик(абрикос), тарвуз(арбуз), гулос(слива), олма(яблоко), узум(виноград), банан, апельсин. "Мева" одиночное → фрукты
-- Мева бозор → сырьё (потому что бозор = закупка продуктов)
+- ХЛЕБ: ТОЛЬКО слово "Нон" или "хлеб" → хлеб. Больше ничего!
+- БОЗОР (Бозор, базар, рынок) → сырьё (НЕ фрукты!)
+- ФРУКТЫ: только конкретные — урик, тарвуз, гулос, олма, узум, банан, апельсин. "Мева" одиночное → фрукты
+- Мева бозор → сырьё
 - Телефон/Алиса/Сим расход → телефония | Шётка/щётка → сырьё
-- Лагмон хамир, хамир → сырьё | Кабель вай фай → телефония
+- Лагмон хамир → сырьё | Кабель вай фай → телефония
 - Кандиянер/кондиционер → прочее
 - Пичок/нож → сырьё | Пепси/Колага/Кумир → напитки
-- КРИТИЧЕСКОЕ ПРАВИЛО ПРИХОДА: type:income ТОЛЬКО если в строке ЯВНО написано слово "приход"/"ПРИХОД"/"тушум". Все остальные строки — ВСЕГДА type:expense, даже если похоже на доход!
-- "приход 5000000" → income, payment_type:cash
-- "приход банк 5000000" / "банк приход" → income, payment_type:bank
-- Любая строка БЕЗ слова "приход" — это РАСХОД (expense)
+- ПРИХОД: type:income ТОЛЬКО если явно написано слово "приход"/"тушум". Иначе ВСЕГДА expense!
+- "приход банк"/"банк приход" → income bank | "приход" → income cash
 - "банк" в расходе → payment_type:bank
-- ВАЖНО: если в тексте НЕТ даты — используй ДАТУ ПО УМОЛЧАНИЮ: {default_date}
-- Если дата ЕСТЬ в тексте — используй её для ВСЕХ строк этого сообщения
+- Нет даты → используй {default_date} | Есть дата → для ВСЕХ строк сообщения
 - Точки = тысячи: 50.000=50000 | Формула 57*3500 → результат
-- Прочерк без суммы → пропустить | "ужн"/"кейин"/"вибга ужн" → пропустить
-- Если непонятно → uncertain:true
+- Прочерк/"ужн"/"кейин" без суммы → пропустить
+- Непонятно → uncertain:true
 
-Сообщение: {text}"""}]
-        )
+Сообщение: {text}"""
+
+        resp = None
+        last_err = None
+        for attempt in range(3):
+            try:
+                resp = client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=4000,
+                    messages=[{"role":"user","content":prompt}])
+                break
+            except Exception as retry_err:
+                last_err = retry_err
+                es = str(retry_err).lower()
+                if 'rate' in es or '429' in es or 'overload' in es:
+                    time.sleep(3*(attempt+1)); continue
+                time.sleep(1); continue
+        if resp is None:
+            raise last_err or Exception("AI недоступен")
+
         raw = re.sub(r'```json|```','',resp.content[0].text.strip()).strip()
-        result = json.loads(raw)
-        return result if isinstance(result,list) else []
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            m2 = re.search(r'\[.*\]', raw, re.DOTALL)
+            if m2:
+                result = json.loads(m2.group(0))
+            else:
+                raise
+        return (result if isinstance(result,list) else []), None
     except Exception as e:
-        logger.error(f"AI parse: {e}"); return []
+        logger.error(f"AI parse error: {e}")
+        return [], str(e)
 
-# ─── AI АССИСТЕНТ (личка с админом) ──────────────────────────────────────────
 async def ai_assistant(update: Update, context, text: str):
     """Свободный диалог с AI-ассистентом в личке"""
     chat_id = update.effective_chat.id
@@ -582,7 +604,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # В группе кнопки только для админа
     is_group = update.effective_chat.type in ["group","supergroup"]
-    menu_buttons = ["📊 Отчёт","💸 Движение средств","💰 Баланс","📋 Последние записи","🔍 Детализация","📥 Excel","ℹ️ Помощь","⚙️ Настройки","➕ Добавить категорию","🔧 Добавить правило","📋 Список правил","🔙 Главное меню"]
+    menu_buttons = ["📊 Отчёт","💸 Движение средств","💰 Баланс","🔍 Детализация","📥 Excel","ℹ️ Помощь","⚙️ Настройки","➕ Добавить категорию","🔧 Добавить правило","📋 Список правил","🔙 Главное меню"]
     if is_group and uid != ADMIN_ID and text in menu_buttons: return
 
     # ─── Личный чат с админом — AI ассистент ───
@@ -672,7 +694,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fallback = chat_last_date.get(chat_id)
 
     # ─── Обработка расходов ───
-    items = parse_with_ai(text, fallback_date=fallback)
+    items, ai_error = parse_with_ai(text, fallback_date=fallback)
+    # Если AI не смог обработать — НЕ молчим, а предупреждаем (защита от пропуска дней!)
+    if ai_error:
+        try:
+            await update.message.reply_text(
+                "⚠️ Не смог обработать это сообщение (перегрузка AI).\n"
+                "🔄 *Отправьте его ещё раз* через несколько секунд — я запишу.",
+                parse_mode="Markdown")
+        except: pass
+        # Дублируем предупреждение админу в личку с текстом сообщения
+        try:
+            await context.bot.send_message(chat_id=ADMIN_ID,
+                text=f"⚠️ ПРОПУЩЕНО сообщение (ошибка AI):\n\n{text[:500]}\n\nПопросите отправить заново.")
+        except: pass
+        return
     if not items: return
 
     saved_exp, saved_inc, uncertain_items, anomaly_items = [], [], [], []
